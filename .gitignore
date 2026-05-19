@@ -1,0 +1,5 @@
+*.o
+otm-bridge
+src/otm-bridge
+*.swp
+.DS_Store

@@ -1,0 +1,137 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=99
+STOP=10
+
+PROG=/usr/bin/otm-bridge
+LED_PATH=/sys/class/leds/green:wifi
+LED_TRIGGER=phy0rx
+LED_TRIGGER_DEFAULT=phy0tpt
+
+led_rx_mode() {
+	[ -e "$LED_PATH/trigger" ] || return 0
+	# Save current trigger once so we can restore on stop
+	if [ ! -f /var/run/otm-bridge.led-prev ]; then
+		awk 'match($0, /\[[^]]+\]/){ s=substr($0,RSTART+1,RLENGTH-2); print s }' \
+			"$LED_PATH/trigger" > /var/run/otm-bridge.led-prev
+	fi
+	echo "$LED_TRIGGER" > "$LED_PATH/trigger" 2>/dev/null
+}
+
+led_restore() {
+	[ -e "$LED_PATH/trigger" ] || return 0
+	local prev
+	prev=$(cat /var/run/otm-bridge.led-prev 2>/dev/null)
+	[ -n "$prev" ] || prev="$LED_TRIGGER_DEFAULT"
+	echo "$prev" > "$LED_PATH/trigger" 2>/dev/null
+	rm -f /var/run/otm-bridge.led-prev
+}
+
+# Wait up to 90 s of uptime for ntpd to have actually synced. The OpenWrt
+# hotplug script writes /var/state/dnsmasqsec exactly on the "stratum" event,
+# but we use uptime (monotonic) for the deadline because NTP's clock-step
+# can jump $(date +%s) forward by days, breaking any wall-clock-based timeout.
+wait_for_clock() {
+	local started now
+	read started _ < /proc/uptime
+	started=${started%.*}
+	while [ ! -f /var/state/dnsmasqsec ]; do
+		read now _ < /proc/uptime
+		now=${now%.*}
+		if [ $(( now - started )) -ge 90 ]; then
+			logger -t otm-bridge "wait_for_clock: timeout waiting for NTP sync, starting anyway"
+			return 1
+		fi
+		sleep 2
+	done
+	# /var/state/dnsmasqsec exists the moment ntpd fires the stratum hotplug,
+	# but the actual clock step finishes a few seconds later. Add slack so
+	# the first TLS handshake doesn't trip on an in-transit clock. Empirically
+	# 5 s was not enough on this hardware, 15 s reliably is.
+	sleep 15
+}
+
+mon_up() {
+	local iface="$1" phy="$2" freq="$3" bw="$4"
+	if ! iw dev "$iface" info >/dev/null 2>&1; then
+		iw phy "$phy" interface add "$iface" type monitor flags otherbss || return 1
+	fi
+	ip link set "$iface" up || return 1
+	iw dev "$iface" set freq "$freq" "$bw" || return 1
+}
+
+mon_down() {
+	local iface="$1"
+	iw dev "$iface" del 2>/dev/null
+}
+
+start_service() {
+	config_load otm-bridge
+	local enabled iface phy freq bw broker node verbose
+	local capture capture_dir capture_size capture_files
+	config_get_bool enabled main enabled 1
+	[ "$enabled" = "1" ] || return 0
+
+	config_get iface   main iface   mon0
+	config_get phy     main phy     phy0
+	config_get freq    main freq    5890
+	config_get bw      main bw      10MHz
+	config_get broker  main broker  'mqtts://cits1.opentrafficmap.org'
+	config_get node    main node    ''
+	config_get verbose main verbose 1
+	config_get_bool capture main capture 0
+	config_get capture_dir   main capture_dir   /tmp
+	config_get capture_size  main capture_size  1
+	config_get capture_files main capture_files 5
+
+	mon_up "$iface" "$phy" "$freq" "$bw" || {
+		logger -t otm-bridge "monitor interface bring-up failed (iface=$iface phy=$phy freq=$freq bw=$bw)"
+		return 1
+	}
+
+	led_rx_mode
+
+	# Sniffer first: tcpdump doesn't need NTP, so let it capture into the
+	# rotating tmpfs ring from the moment mon0 is live. Otherwise we lose
+	# all frames that arrive during the wait_for_clock window.
+	if [ "$capture" = "1" ]; then
+		mkdir -p "$capture_dir"
+		procd_open_instance sniffer
+		procd_set_param command /usr/bin/tcpdump \
+			-i "$iface" -n -s 0 -U \
+			-w "$capture_dir/mon0-%Y%m%d-%H%M%S.pcap" \
+			-G 3600 -C "$capture_size" -W "$capture_files"
+		procd_set_param respawn 3600 10 0
+		procd_set_param stdout 1
+		procd_set_param stderr 1
+		procd_close_instance
+	fi
+
+	# Bridge afterwards: TLS handshake against cits1.opentrafficmap.org
+	# requires a synced clock for certificate validity.
+	wait_for_clock
+
+	procd_open_instance bridge
+	procd_set_param command "$PROG" -f -i "$iface" -b "$broker"
+	[ -n "$node" ] && procd_append_param command -n "$node"
+	[ "$verbose" -ge 1 ] 2>/dev/null && procd_append_param command -v
+	[ "$verbose" -ge 2 ] 2>/dev/null && procd_append_param command -v
+	procd_set_param respawn 3600 10 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file /etc/config/otm-bridge
+	procd_close_instance
+}
+
+stop_service() {
+	config_load otm-bridge
+	local iface
+	config_get iface main iface mon0
+	led_restore
+	mon_down "$iface"
+}
+
+service_triggers() {
+	procd_add_reload_trigger "otm-bridge"
+}

@@ -1,0 +1,48 @@
+#!/bin/sh
+# /etc/uci-defaults/99-otm-setup
+#
+# Runs once on first boot (OpenWrt deletes the script after success).
+# Provisions a fresh image for use as an opentrafficmap.org 802.11p receiver:
+#   - lan1 becomes the WAN port (DHCP + IPv6 RA)
+#   - lan2..4 stay in br-lan for local administration (192.168.1.1/24)
+#   - SSH from the WAN zone is allowed (so the box stays reachable after
+#     you plug it into your home LAN)
+#   - hostname is set to "opentrafficmap"
+#
+# Idempotent — running again on an already-configured system is a no-op.
+
+set -e
+
+# --- Network: split lan1 off the bridge, run it as WAN ----------------------
+
+uci -q del_list network.@device[0].ports='lan1'
+
+# Drop the stock DSL/PPPoE remnants in case they are still around
+uci -q delete network.wan.username   2>/dev/null || true
+uci -q delete network.wan.password   2>/dev/null || true
+
+uci set network.wan.device='lan1'
+uci set network.wan.proto='dhcp'
+uci set network.wan.peerdns='1'
+uci set network.wan.ipv6='1'
+uci set network.wan6.proto='dhcpv6'
+uci commit network
+
+# --- Firewall: open SSH on the WAN zone -------------------------------------
+
+if ! uci show firewall | grep -q "name='Allow-SSH-WAN'"; then
+	sec=$(uci add firewall rule)
+	uci set "firewall.${sec}.name=Allow-SSH-WAN"
+	uci set "firewall.${sec}.src=wan"
+	uci set "firewall.${sec}.proto=tcp"
+	uci set "firewall.${sec}.dest_port=22"
+	uci set "firewall.${sec}.target=ACCEPT"
+fi
+uci commit firewall
+
+# --- Hostname ---------------------------------------------------------------
+
+uci set system.@system[0].hostname='opentrafficmap'
+uci commit system
+
+exit 0
