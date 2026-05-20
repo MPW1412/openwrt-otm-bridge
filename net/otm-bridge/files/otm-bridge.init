@@ -58,6 +58,26 @@ mon_up() {
 		iw phy "$phy" interface add "$iface" type monitor flags otherbss || return 1
 	fi
 	ip link set "$iface" up || return 1
+
+	# CRITICAL: iw's "set freq <f> 10MHz" only labels the channel in cfg80211 —
+	# the ath9k hardware demodulator stays at 20 MHz full-rate unless we also
+	# toggle the chip-side chanbw register via debugfs. Without this, ITS-G5
+	# half-rate OFDM frames get decoded as garbage and dropped as CRC errors,
+	# never reaching netdev counters. Symptom: rx_packets=0 even within range
+	# of a real transmitter; ath9k debugfs "recv" shows CRC ERR climbing.
+	local chanbw_path="/sys/kernel/debug/ieee80211/$phy/ath9k/chanbw"
+	if [ -e "$chanbw_path" ]; then
+		local chanbw_val
+		case "$bw" in
+			5MHz)   chanbw_val=2 ;;
+			10MHz)  chanbw_val=1 ;;
+			20MHz)  chanbw_val=0 ;;
+			*)      chanbw_val=0 ;;
+		esac
+		echo "$chanbw_val" > "$chanbw_path" || \
+			logger -t otm-bridge "failed to write chanbw=$chanbw_val for $phy"
+	fi
+
 	iw dev "$iface" set freq "$freq" "$bw" || return 1
 }
 
