@@ -23,7 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define OTM_BRIDGE_VERSION "0.9"
+#define OTM_BRIDGE_VERSION "0.10"
 
 static struct mosquitto *mosq;
 static pcap_t *pc;
@@ -148,12 +148,31 @@ static void on_log(struct mosquitto *m, void *ud, int level, const char *str)
 		syslog(LOG_DEBUG, "mosq: %s", str);
 }
 
+/* opentrafficmap.org's ingest (cits-wireshark-bridge) decodes the MQTT
+ * payload with PCAP_LINKTYPE=105 (DLT_IEEE802_11) — raw 802.11 frames,
+ * NO radiotap header. mac80211 monitor-mode hands us DLT_IEEE802_11_RADIO
+ * (DLT 127), so we strip the radiotap prefix before publishing. The
+ * radiotap header is little-endian and self-describes its length via
+ * `it_len` at offset 2. */
+static unsigned int radiotap_len(const u_char *p, unsigned int caplen)
+{
+	if (caplen < 8 || p[0] != 0 /* it_version */)
+		return 0;
+	unsigned int it_len = (unsigned int)p[2] | ((unsigned int)p[3] << 8);
+	if (it_len < 8 || it_len > caplen)
+		return 0;
+	return it_len;
+}
+
 static void pkt_handler(u_char *ud, const struct pcap_pkthdr *h, const u_char *bytes)
 {
 	(void)ud;
 	if (!mosq) return;
+	unsigned int rt = radiotap_len(bytes, h->caplen);
+	const u_char *frame = bytes + rt;
+	int frame_len = (int)(h->caplen - rt);
 	int r = mosquitto_publish(mosq, NULL, topic_packet,
-				   (int)h->caplen, bytes, 0, false);
+				   frame_len, frame, 0, false);
 	if (r == MOSQ_ERR_SUCCESS) {
 		pkt_published++;
 		if (verbose && (pkt_published % 100 == 0))
