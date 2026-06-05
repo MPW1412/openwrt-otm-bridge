@@ -3,30 +3,46 @@
 #
 # Runs once on first boot (OpenWrt deletes the script after success).
 # Provisions a fresh image for use as an opentrafficmap.org 802.11p receiver:
-#   - lan1 becomes the WAN port (DHCP + IPv6 RA)
-#   - lan2..4 stay in br-lan for local administration (192.168.1.1/24)
+#   - On devices without a real Ethernet WAN port (DSL-only, e.g. FRITZ!Box 3390):
+#     rewire lan1 out of br-lan and into the wan interface (DHCP + IPv6 RA).
+#   - On devices with a real WAN port (WDR4300, CPE510, ...):
+#     leave network.wan.* alone — the stock board.d config is already correct.
 #   - SSH from the WAN zone is allowed (so the box stays reachable after
-#     you plug it into your home LAN)
-#   - hostname is set to "opentrafficmap"
+#     you plug it into your home LAN).
+#   - hostname is set to "opentrafficmap".
 #
 # Idempotent — running again on an already-configured system is a no-op.
 
 set -e
 
-# --- Network: split lan1 off the bridge, run it as WAN ----------------------
+# --- Network: rewire only if no real Ethernet WAN exists --------------------
 
-uci -q del_list network.@device[0].ports='lan1'
+cur_wan_dev=$(uci -q get network.wan.device || true)
 
-# Drop the stock DSL/PPPoE remnants in case they are still around
-uci -q delete network.wan.username   2>/dev/null || true
-uci -q delete network.wan.password   2>/dev/null || true
+case "$cur_wan_dev" in
+	""|dsl0|dsl*|ptm0|ptm*|atm0|atm*)
+		needs_rewire=1
+		;;
+	*)
+		needs_rewire=0
+		;;
+esac
 
-uci set network.wan.device='lan1'
-uci set network.wan.proto='dhcp'
-uci set network.wan.peerdns='1'
-uci set network.wan.ipv6='1'
-uci set network.wan6.proto='dhcpv6'
-uci commit network
+if [ "$needs_rewire" = 1 ]; then
+	# Pull lan1 out of br-lan (idempotent: del_list on a missing entry is a no-op)
+	uci -q del_list network.@device[0].ports='lan1'
+
+	# Drop any DSL/PPPoE remnants that may still be on the wan interface
+	uci -q delete network.wan.username 2>/dev/null || true
+	uci -q delete network.wan.password 2>/dev/null || true
+
+	uci set network.wan.device='lan1'
+	uci set network.wan.proto='dhcp'
+	uci set network.wan.peerdns='1'
+	uci set network.wan.ipv6='1'
+	uci set network.wan6.proto='dhcpv6'
+	uci commit network
+fi
 
 # --- Firewall: open SSH on the WAN zone -------------------------------------
 
